@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Anatomy Viewer — Emissive Build v7.2 (Null-anchored dots, no gizmo)</title>
+  <style>
+    html,body{margin:0;height:100%;background:#0C0F13;color:#e6e6e6;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    #canvas{width:100%;height:100%;display:block}
+    #hud{position:fixed;top:10px;right:10px;display:flex;gap:10px;z-index:12;align-items:flex-start;flex-wrap:wrap;transform:scale(.9);transform-origin:top right}
+    .btn{display:inline-flex;align-items:center;gap:8px;background:#14181f;color:#e6e6e6;border:1px solid #2a3140;border-radius:8px;padding:8px 10px;font-size:15px;cursor:pointer}
+    .btn:active{transform:translateY(1px)}
+    .btn .icon{width:16px;height:16px;display:inline-block;filter:invert(1);opacity:.9}
+    .pill{display:flex;align-items:center;gap:6px;background:rgba(20,24,31,.9);border:1px solid #2a3140;color:#e6e6e6;border-radius:10px;padding:6px 8px}
+    .num{min-width:3ch;text-align:right;font-variant-numeric:tabular-nums}
+    #status{position:fixed;left:10px;bottom:10px;background:rgba(0,0,0,.65);color:#fff;padding:6px 8px;border-radius:8px;font-size:12px;max-width:70vw;white-space:pre-wrap;z-index:12}
+
+    /* Selection list */
+    #selPanel{display:flex;flex-direction:column;gap:6px;max-height:40vh;overflow:auto;min-width:200px}
+    #selPanel h4{margin:0 0 4px 0;font-size:13px;color:#9fb0c9;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+    #selList{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+    #selList li{background:#0f141b;border:1px solid #263041;color:#dbe7ff;padding:4px 6px;border-radius:6px;font-size:14px}
+    input[type="color"]{background:transparent;border:none}
+    input[type="range"]{accent-color:#9EDFFF}
+
+    /* Dots overlay */
+    #dots{position:fixed;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:11}
+    .dot{position:absolute;transform:translate(-50%,-50%);pointer-events:auto;cursor:pointer;width:5px;height:5px;border-radius:50%;background:#fff;border:2px solid #000;box-shadow:none}
+    .dot.dim{opacity:0.45}
+    .dot.hidden{display:none}
+  </style>
+  <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+  <script type="importmap">
+  {"imports":{
+    "three":"https://unpkg.com/three@0.161.0/build/three.module.js",
+    "three/addons/":"https://unpkg.com/three@0.161.0/examples/jsm/"
+  }}
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="dots"></div>
+
+  <div id="hud">
+    <button id="reset" class="btn" title="Reset camera and selection"><img class="icon" src="https://raw.githubusercontent.com/ken-odonnell/model-host/main/reset-icon.svg" alt=""> Reset</button>
+    
+
+    <label class="pill">BG <input id="bg" type="color" value="#0C0F13"></label>
+
+    <label class="pill">Albedo
+      <input id="shade" type="color" value="#2b2b2b">
+      <input id="albedoI" type="range" min="0" max="2" step="0.01" value="1">
+      <span id="albedoVal" class="num">1.00</span>
+    </label>
+
+    <label class="pill">Emissive
+      <input id="emiColor" type="color" value="#9EDFFF">
+      <input id="emiI" type="range" min="0" max="5" step="0.01" value="2">
+      <span id="emiIval" class="num">2.00</span>
+    </label>
+    <div id="selPanel" class="pill">
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
+        <h4 style="flex:1">Selected Parts</h4>
+        <button id="clearSel" class="btn" style="padding:4px 8px">Clear</button>
+      </div>
+      <ul id="selList"></ul>
+    </div>
+  </div>
+  <div id="status" role="status" aria-live="polite"></div>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+  import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+
+  // ---------- Config ----------
+  const RAW_PLACEHOLDER = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6XK5NQAAAAASUVORK5CYII='; // 1×1 transparent PNG
+  const EMISSIVE_FALLBACK_URL = 'https://github.com/ken-odonnell/model-host/blob/main/AvatarTexture.png';
+  const GLB_URLS = [
+    'https://github.com/ken-odonnell/model-host/blob/main/Avatar.glb'
+  ];
+  const BLOCK_LIST = new Set(['body']);
+  const ANIM_MS = 1000; // 1s transition between lit and dim
+
+  // ---------- DOM ----------
+  const canvas = document.getElementById('canvas');
+  const dotsLayer = document.getElementById('dots');
+  const resetBtn = document.getElementById('reset');
+  
+  const bg = document.getElementById('bg');
+  const shadePicker = document.getElementById('shade');
+  const albedoI = document.getElementById('albedoI');
+  const albedoVal = document.getElementById('albedoVal');
+  const emiColor = document.getElementById('emiColor');
+  const emiI = document.getElementById('emiI');
+  const emiIval = document.getElementById('emiIval');
+  const statusEl = document.getElementById('status');
+  const selList = document.getElementById('selList');
+  const clearSel = document.getElementById('clearSel');
+  const resetBtnEl = document.getElementById('reset');
+
+  const logDebug = ()=>{}; // no debug UI
+  function setStatus(t){ statusEl.textContent = t || ''; }
+
+  // ---------- Three.js ----------
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.NoToneMapping;
+  renderer.setClearColor(0x000000, 0);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 10000);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true; controls.dampingFactor = 0.06; controls.zoomSpeed = 1.6; controls.rotateSpeed = 1.2; controls.panSpeed = 1.2;
+  controls.minDistance = 0.02; controls.maxDistance = 2000; controls.zoomToCursor = true;
+
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x404040, 0.5); scene.add(hemi);
+
+  let root = null; let meshes = []; let litSet = new Set(); let parts = new Map();
+  let homeTarget = new THREE.Vector3(); let homePos = new THREE.Vector3(); let radius = 1;
+  const originalMat = new WeakMap();
+  const meshAnim = new WeakMap(); // mesh -> {t, target}
+  const partCenters = new Map(); // partName -> world center
+  const partAnchors = new Map(); // anchorKey -> Vector3 (member name or canonical)
+  const partDots = new Map();    // anchorKey -> HTMLElement
+  let lastClickedKey = null;
+  // turntable orbit state for arms
+  const turntable = { active:false, center:new THREE.Vector3(), speed:0.15, token:0 };
+  function stopTurntable(){ turntable.active=false; turntable.token++; }
+  function startTurntableAfter(ms, center){ const my=++turntable.token; setTimeout(()=>{ if(turntable.token!==my) return; turntable.active=true; turntable.center.copy(center); }, ms); }
+
+  // ---------- UI state ----------
+  const saved = {
+    bg: localStorage.getItem('viewer_bg') || '#0C0F13',
+    shade: localStorage.getItem('viewer_shade') || '#2b2b2b',
+    albedoI: parseFloat(localStorage.getItem('viewer_albedoI') || '1'),
+    emiColor: localStorage.getItem('viewer_emiColor') || '#9EDFFF',
+    emiI: parseFloat(localStorage.getItem('viewer_emiI') || '2')
+  };
+  bg.value = saved.bg; shadePicker.value = saved.shade; albedoI.value = String(saved.albedoI); albedoVal.textContent = saved.albedoI.toFixed(2);
+  emiColor.value = saved.emiColor; emiI.value = String(saved.emiI); emiIval.textContent = saved.emiI.toFixed(2);
+  
+  document.body.style.background = saved.bg;
+
+  bg.addEventListener('input', e=>{ const v=e.target.value; localStorage.setItem('viewer_bg', v); document.body.style.background = v; renderer.setClearColor(0x000000, 0); });
+  shadePicker.addEventListener('input', e=>{ const v=e.target.value; localStorage.setItem('viewer_shade', v); });
+  albedoI.addEventListener('input', e=>{ const v=parseFloat(e.target.value); localStorage.setItem('viewer_albedoI', String(v)); albedoVal.textContent=v.toFixed(2); });
+  emiColor.addEventListener('input', e=>{ const v=e.target.value; localStorage.setItem('viewer_emiColor', v); });
+  emiI.addEventListener('input', e=>{ const v=parseFloat(e.target.value); localStorage.setItem('viewer_emiI', String(v)); emiIval.textContent=v.toFixed(2); });
+
+  // ---------- Helpers ----------
+  function normalizeGitHubURL(u){
+    try{
+      const url = new URL(u, location.href);
+      if (url.hostname === 'github.com'){
+        const seg = url.pathname.split('/').filter(Boolean);
+        if (seg.length >= 5){
+          const user = seg[0], repo = seg[1], mode = seg[2], branch = seg[3];
+          const path = seg.slice(4).join('/');
+          if (['blob','raw','edit','tree'].includes(mode)){
+            return `https://raw.githubusercontent.com/${user}/${repo}/${branch}/${path}`;
+          }
+        }
+      }
+      return u;
+    }catch{ return u; }
+  }
+  function urlDir(u){ try{ const url=new URL(u); url.pathname=url.pathname.replace(/[^/]*$/, ''); return url.href; }catch{ return u; } }
+
+  function canonKey(name){
+    let s = (name||'').toLowerCase();
+    s = s.replace(/(_null)\b/gi, '');
+    s = s.replace(/\bnull\b/gi, '');
+    s = s.replace(/(_l|_r)\b/gi, '');
+    s = s.replace(/\b(left|right)\b/gi, '');
+    s = s.replace(/\b(l|r)\b/gi, '');
+    s = s.replace(/[_-]+/g, ' ');
+    s = s.replace(/\s+/g, ' ').trim();
+    return s;
+  }
+
+  // ---------- Materials ----------
+  function cloneMaterial(mat){
+    const make = (m)=>{
+      const out = new THREE.MeshStandardMaterial();
+      out.map = m?.map || null;
+      out.normalMap = m?.normalMap || null;
+      out.roughnessMap = m?.roughnessMap || null;
+      out.metalnessMap = m?.metalnessMap || null;
+      out.emissiveMap = m?.emissiveMap || null;
+      out.color = (m?.color ? m.color.clone() : new THREE.Color(0x000000));
+      const hasEmissiveMap = !!m?.emissiveMap;
+      out.emissive = hasEmissiveMap ? new THREE.Color(emiColor.value) : (m?.emissive ? m.emissive.clone() : new THREE.Color(0x000000));
+      out.emissiveIntensity = typeof m?.emissiveIntensity==='number' ? m.emissiveIntensity : 1;
+      out.roughness = typeof m?.roughness==='number' ? m.roughness : 1;
+      out.metalness = typeof m?.metalness==='number' ? m.metalness : 0;
+      out.transparent = !!m?.transparent; out.opacity = typeof m?.opacity==='number' ? m.opacity : 1;
+      return out;
+    };
+    return Array.isArray(mat) ? mat.map(make) : make(mat||{});
+  }
+  function storeOriginal(m){
+    const mat = m.material;
+    originalMat.set(m, {
+      color: mat.color ? mat.color.clone() : null,
+      emissive: mat.emissive ? mat.emissive.clone() : null,
+      emissiveIntensity: typeof mat.emissiveIntensity==='number' ? mat.emissiveIntensity : 1
+    });
+    meshAnim.set(m, { t:1, target:1 }); // default lit
+  }
+
+  function desiredLitForMesh(m){
+    if (litSet.size===0) return true; // all lit by default
+    const part = topPartName(m);
+    return !BLOCK_LIST.has(part.toLowerCase()) && litSet.has(part);
+  }
+
+  function applyShadingFromAnim(m){
+    const rec = originalMat.get(m) || {};
+    const anim = meshAnim.get(m) || {t:1};
+    const blend = anim.t; // 1 = lit, 0 = dim
+    const ease = blend*blend*(3-2*blend);
+
+    const baseAlbedo = new THREE.Color(shadePicker.value);
+    const albedoMul = parseFloat(albedoI.value) * (0.35 + (1-0.35)*ease);
+    if (m.material.color) m.material.color.copy(baseAlbedo).multiplyScalar(albedoMul);
+
+    const baseEmissive = m.material.emissiveMap ? new THREE.Color(emiColor.value) : (rec.emissive ? rec.emissive.clone() : new THREE.Color(0x000000));
+    const emissMul = (rec.emissiveIntensity ?? 1) * parseFloat(emiI.value) * (0.25 + (1-0.25)*ease);
+    if (m.material.emissive) m.material.emissive.copy(baseEmissive).multiplyScalar(0.2 + (1-0.2)*ease);
+    if ('emissiveIntensity' in m.material) m.material.emissiveIntensity = emissMul;
+  }
+
+  function updateAnimTargets(){ meshes.forEach(m=>{ const a=meshAnim.get(m); if(!a) meshAnim.set(m,{t:1,target:1}); const target = desiredLitForMesh(m) ? 1 : 0; meshAnim.get(m).target = target; }); }
+
+  // ---------- Scene prep ----------
+  function topPartName(o){ let c=o, name=o.name||''; while(c&&c.parent&&c.parent!==root){ if(c.parent.name) name=c.parent.name; c=c.parent; } return name||o.parent?.name||o.name||''; }
+  function groundSnapAndFrame(){
+    const bbox = new THREE.Box3().setFromObject(root);
+    const minY=bbox.min.y; root.position.y -= minY;
+    const sphere=bbox.getBoundingSphere(new THREE.Sphere());
+    radius=Math.max(1e-3,sphere.radius);
+    const dist=radius*2.2; camera.position.set(sphere.center.x, sphere.center.y+radius*0.5, sphere.center.z+dist);
+    controls.target.set(sphere.center.x, sphere.center.y, sphere.center.z);
+    homeTarget.copy(controls.target); homePos.copy(camera.position);
+    camera.near=Math.max(0.01,radius*0.01); camera.far=Math.max(1000,radius*50); camera.updateProjectionMatrix();
+    controls.minDistance=radius*0.05; controls.maxDistance=radius*50.0;
+  }
+
+  // ---------- Camera tween ----------
+  let focusTween = null; const tweenQueue = [];
+  function startCamTween(toPos, toTgt, durMs=800){ const t={ t0: performance.now(), dur: durMs, fromPos: camera.position.clone(), fromTgt: controls.target.clone(), toPos: toPos.clone(), toTgt: toTgt.clone() }; if(focusTween) tweenQueue.push(t); else focusTween=t; }
+  function stepFocusTween(){ if(!focusTween) return; const t=(performance.now()-focusTween.t0)/focusTween.dur; const k=Math.min(1,t); const e=k*k*(3-2*k); camera.position.lerpVectors(focusTween.fromPos, focusTween.toPos, e); controls.target.lerpVectors(focusTween.fromTgt, focusTween.toTgt, e); if(k>=1){ focusTween=null; if(tweenQueue.length){ focusTween=tweenQueue.shift(); focusTween.t0=performance.now(); } } }
+  function startFocusTweenTo(center, partRadius, durMs=800){ const fov=THREE.MathUtils.degToRad(camera.fov); const pad=2.4; const distFit=(partRadius/Math.tan(fov*0.5))*pad; const dir=new THREE.Vector3().subVectors(camera.position, controls.target).normalize(); const toPos=new THREE.Vector3().copy(center).addScaledVector(dir, Math.max(distFit, controls.minDistance*1.5)); startCamTween(toPos, center.clone(), durMs); }
+  function startHomeTween(durMs=800){ tweenQueue.length=0; focusTween=null; startCamTween(homePos.clone(), homeTarget.clone(), durMs); }
+  function startFocusFromSide(center, partRadius, sideSign=1, durMs=900){
+    const fov = THREE.MathUtils.degToRad(camera.fov);
+    const pad = 2.4;
+    const distFit = (partRadius/Math.tan(fov*0.5))*pad;
+    const clamped = Math.sign(sideSign)||1;
+    const a = 0.70710678; // cos/sin(45deg)
+    const toPos = new THREE.Vector3(
+      center.x + clamped*distFit*a,
+      center.y + partRadius*0.08,
+      center.z + distFit*a
+    );
+    startCamTween(toPos, center.clone(), durMs);
+  }
+  function getSideSign(focusMember, worldX){
+    let sign = 0;
+    if (focusMember){
+      if (/_l/i.test(focusMember) || /left/i.test(focusMember)) sign = -1;
+      else if (/_r/i.test(focusMember) || /right/i.test(focusMember)) sign = 1;
+    }
+    if (!sign){ sign = (worldX >= homeTarget.x) ? 1 : -1; }
+    return sign;
+  }
+
+  // ---------- Loader with multi-stage texture fallback ----------
+  function makeLoader(){
+    const manager = new THREE.LoadingManager();
+    const ktx2 = new KTX2Loader(manager)
+      .setTranscoderPath('https://unpkg.com/three@0.161.0/examples/jsm/libs/basis/')
+      .detectSupport(renderer);
+    const loader = new GLTFLoader(manager);
+    loader.setCrossOrigin('anonymous');
+    loader.setKTX2Loader(ktx2);
+    return { loader, manager };
+  }
+
+  async function loadWithRetry(url){
+    const normalized = normalizeGitHubURL(url);
+    const base = urlDir(normalized);
+
+    const failed = new Set();
+    const { loader, manager } = makeLoader();
+    manager.setURLModifier((u)=> normalizeGitHubURL(u));
+    manager.itemError = (u)=>{ failed.add(normalizeGitHubURL(u)); };
+
+    try{
+      setStatus('Loading '+ normalized.split('/').slice(-1)[0] +' …');
+      loader.setResourcePath(base);
+      const g = await loader.loadAsync(normalized);
+      setStatus('Loaded');
+      return { gltf:g, failed: Array.from(failed) };
+    }catch(err){
+      // Attempt 2: redirect all image-like URLs to the repo emissive PNG
+      const fallback = normalizeGitHubURL(EMISSIVE_FALLBACK_URL);
+      const { loader: loader2, manager: manager2 } = makeLoader();
+      manager2.setURLModifier((u)=>{ const n = normalizeGitHubURL(u); return /\.(png|jpe?g|webp|ktx2)$/i.test(n) ? fallback : n; });
+      try{ loader2.setResourcePath(base); const g2 = await loader2.loadAsync(normalized); setStatus('Loaded with repo texture fallback'); return { gltf:g2, failed: Array.from(failed) }; }
+      catch(err2){
+        // Attempt 3: hard fallback to tiny data-URL to guarantee decode
+        const { loader: loader3, manager: manager3 } = makeLoader();
+        manager3.setURLModifier((u)=>{ const n = normalizeGitHubURL(u); return /\.(png|jpe?g|webp|ktx2)$/i.test(n) ? RAW_PLACEHOLDER : n; });
+        try{ loader3.setResourcePath(base); const g3 = await loader3.loadAsync(normalized); setStatus('Loaded with data-URL placeholder textures'); return { gltf:g3, failed: Array.from(failed) }; }
+        catch(err3){ setStatus('Error after all retries: '+(err3?.message||err3)); throw err3; }
+      }
+    }
+  }
+
+  async function tryURLs(urls){ for(const url of urls){ try{ const { gltf } = await loadWithRetry(url); return gltf; } catch(e){ console.warn('Load failed', url, e); } } return null; }
+
+  function clearModel(){ if(!root) return; scene.remove(root); root=null; meshes=[]; litSet.clear(); parts.clear(); updateSelUI(); clearDots(); }
+
+  function attachModel(gltf){
+    clearModel(); root=gltf.scene||gltf.scenes?.[0]; scene.add(root);
+    meshes = []; root.traverse(o=>{ if(o.isMesh){ o.material = cloneMaterial(o.material); storeOriginal(o); meshes.push(o); } });
+    parts.clear(); const all=[]; root.traverse(o=>{ if(o.isMesh) all.push(o); });
+    for(const m of all){ let p=m; while(p.parent&&p.parent!==root) p=p.parent; const key=p.name||m.name||'Part'; if(!parts.has(key)) parts.set(key,{meshes:[]}); parts.get(key).meshes.push(m); }
+
+    computePartCenters();
+    buildDots();
+
+    groundSnapAndFrame(); litSet.clear(); updateAnimTargets(); updateSelUI();
+  }
+
+  // ---------- Dots ----------
+  function clearDots(){ dotsLayer.innerHTML=''; partDots.clear(); }
+
+  function groupByCanonical(){
+    const map = new Map();
+    for (const name of parts.keys()){
+      if (BLOCK_LIST.has(name.toLowerCase())) continue;
+      const key = canonKey(name);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(name);
+    }
+    return map;
+  }
+
+  function computePartCenters(){
+    partCenters.clear();
+    for (const [name, rec] of parts){ if (BLOCK_LIST.has(name.toLowerCase())) continue; const box=new THREE.Box3(); rec.meshes.forEach(m=>box.expandByObject(m)); const c=box.getCenter(new THREE.Vector3()); partCenters.set(name, c); }
+  }
+
+  function collectNullAnchors(){
+    const list = [];
+    root.traverse(o=>{
+      if (o.isMesh) return;
+      if (!o.name) return;
+      const n = o.name;
+      if (/_null\b/i.test(n)) list.push(o);
+    });
+    return list;
+  }
+
+  function buildDots(){
+    clearDots(); partAnchors.clear();
+
+    const authored = collectNullAnchors();
+    const seenCanon = new Set();
+    for (const o of authored){
+      const world = o.getWorldPosition(new THREE.Vector3());
+      const local = world.clone(); root.worldToLocal(local);
+      const canon = canonKey(o.name);
+      if (BLOCK_LIST.has(canon)) continue;
+      const key = o.name;
+      partAnchors.set(key, local);
+      createDotElement(key, canon, local);
+      seenCanon.add(canon);
+    }
+
+    const groups = groupByCanonical();
+    for (const [key, members] of groups){
+      if (seenCanon.has(key)) continue;
+      const hasSides = members.some(n=>/_([lr])\b/i.test(n) || /\b(left|right)\b/i.test(n));
+      if (hasSides){ members.forEach(n=> placeDotForAnchor(n, key)); }
+      else {
+        const c = new THREE.Vector3(); members.forEach(n=> c.add(partCenters.get(n)||new THREE.Vector3())); c.multiplyScalar(1/Math.max(1,members.length)); partAnchors.set(key, c); createDotElement(key, key, c);
+      }
+    }
+    
+  }
+
+  function placeDotForAnchor(memberName, canonical){ const c = partCenters.get(memberName) || new THREE.Vector3(); partAnchors.set(memberName, c.clone()); createDotElement(memberName, canonical, c); }
+
+  function titleize(s){ return s.split(' ').map(w=>w? w[0].toUpperCase()+w.slice(1) : '').join(' '); }
+  function createDotElement(anchorKey, canonicalKey){
+    const el=document.createElement('div');
+    el.className='dot';
+    el.title=canonicalKey;
+    el.dataset.anchor=anchorKey;
+    el.dataset.canon=canonicalKey;
+    dotsLayer.appendChild(el);
+    partDots.set(anchorKey, el);
+    el.addEventListener('click', (e)=>{ e.stopPropagation(); toggleSelectByCanonical(canonicalKey, anchorKey); });
+  }
+
+  
+  function updateDots(){
+    if(!root) return;
+    const v=new THREE.Vector3();
+    const proj=new THREE.Vector3();
+    const r=renderer.domElement.getBoundingClientRect();
+    const camPos = camera.position.clone();
+    const ray = new THREE.Raycaster();
+    for(const [anchorKey, el] of partDots){
+      const anchor = partAnchors.get(anchorKey); if(!anchor) continue;
+      v.copy(anchor); root.localToWorld(v);
+      // Project to screen
+      proj.copy(v).project(camera);
+      const x=(proj.x*0.5+0.5)*r.width + r.left;
+      const y=(-proj.y*0.5+0.5)*r.height + r.top;
+      el.style.left = x+'px'; el.style.top = y+'px';
+      // Occlusion
+      const dir = new THREE.Vector3().subVectors(v, camPos);
+      const dist = dir.length(); dir.normalize();
+      ray.set(camPos, dir);
+      const hits = ray.intersectObjects(meshes, true);
+      const blocked = hits.length && hits[0].distance < dist - 0.005;
+      el.classList.toggle('hidden', blocked);
+      // Dim
+      const canon = el.dataset.canon;
+      const members = Array.from(parts.keys()).filter(n=>canonKey(n)===canon);
+      const selected = members.some(n=>litSet.has(n));
+      const dim = (litSet.size>0 && !selected);
+      el.classList.toggle('dim', dim);
+    }
+  }
+
+  // ---------- Display names ----------
+  const DISPLAY_NAME_MAP = {
+    'neck chin':'Neck/Chin', 'neck/chin':'Neck/Chin',
+    'chest':'Chest',
+    'abdomen':'Abdomen',
+    'pubic':'Pubic',
+    'flank':'Flanks', 'flanks':'Flanks',
+    'lower back':'Lower Back', 'mid back':'Mid Back', 'upper back':'Upper Back',
+    'armpit':'Armpits',
+    'banana roll':'Banana Rolls',
+    'upper arm':'Upper Arms', 'lower arm':'Lower Arms',
+    'inner thigh':'Inner Thighs', 'outer thigh':'Outer Thighs'
+  };
+  function titleCase(str){ return (str||'').split(' ').map(w=>w? w[0].toUpperCase()+w.slice(1):'').join(' '); }
+  function niceName(canon){ const key=(canon||'').trim().toLowerCase(); return DISPLAY_NAME_MAP[key] || titleCase(canon||''); }
+
+  // ---------- Selection UI ----------
+  function updateSelUI(){
+    const canonSel = new Set();
+    for (const n of litSet) canonSel.add(canonKey(n));
+    /* count removed */
+    selList.innerHTML = '';
+    if (canonSel.size===0){ const li=document.createElement('li'); li.textContent='None'; selList.appendChild(li); return; }
+    Array.from(canonSel).sort((a,b)=>a.localeCompare(b)).forEach(name=>{ const li=document.createElement('li'); li.textContent=niceName(name); selList.appendChild(li); });
+  }
+  clearSel.addEventListener('click', ()=>{ litSet.clear(); updateAnimTargets(); updateSelUI(); stopTurntable(); startHomeTween(600); });
+  resetBtnEl.addEventListener('click', ()=>{ litSet.clear(); updateAnimTargets(); updateSelUI(); stopTurntable(); startHomeTween(600); });
+
+  // ---------- Picking ----------
+  const raycaster=new THREE.Raycaster(); const ndc=new THREE.Vector2();
+  const down = {x:0,y:0,t:0,moved:false};
+  renderer.domElement.addEventListener('pointerdown', (e)=>{ down.x=e.clientX; down.y=e.clientY; down.t=performance.now(); down.moved=false; }, {passive:true});
+  renderer.domElement.addEventListener('pointermove', (e)=>{ if(down.t){ const dx=e.clientX-down.x, dy=e.clientY-down.y; if(Math.hypot(dx,dy)>6) down.moved=true; } }, {passive:true});
+  function pickAt(clientX, clientY){ const r=renderer.domElement.getBoundingClientRect(); ndc.x=((clientX-r.left)/r.width)*2-1; ndc.y=-((clientY-r.top)/r.height)*2+1; raycaster.setFromCamera(ndc,camera); const hits=raycaster.intersectObjects(meshes,true); if(!hits.length) return null; const part=topPartName(hits[0].object); if(BLOCK_LIST.has(part.toLowerCase())) return null; return part; }
+  renderer.domElement.addEventListener('pointerup', (e)=>{ const dt=performance.now()-down.t; const wasDrag = down.moved || dt>300; down.t=0; if(wasDrag) return; const member = pickAt(e.clientX, e.clientY); if(!member) return; const key = canonKey(member); toggleSelectByCanonical(key, member); }, {passive:false});
+
+  function toggleSelectByCanonical(canonKeyStr, focusMember=null){
+    const groups = groupByCanonical();
+    const members = groups.get(canonKeyStr) || [];
+    const isRepeat = lastClickedKey === canonKeyStr;
+    lastClickedKey = canonKeyStr;
+
+    const anySelected = members.some(n=>litSet.has(n));
+    if (anySelected){ members.forEach(n=>litSet.delete(n)); } else { members.forEach(n=>litSet.add(n)); }
+
+    updateAnimTargets();
+    updateSelUI();
+
+    if (isRepeat){ stopTurntable(); startHomeTween(600); return; }
+
+    // Prefer focusing authored null for the clicked side
+    const anchorForMember = focusMember ? `${focusMember}_Null` : null;
+    if (anchorForMember && partAnchors.has(anchorForMember)){
+      const local = partAnchors.get(anchorForMember).clone(); const world = local.clone(); root.localToWorld(world);
+      if (canonKeyStr==='armpit'){ const sign = getSideSign(focusMember, world.x); startFocusFromSide(world, Math.max(1e-3, radius*0.18), sign, 900); stopTurntable(); return; }
+      startFocusTweenTo(world, Math.max(1e-3, radius*0.18), 900);
+      if (canonKeyStr==='upper arm' || canonKeyStr==='lower arm'){ startTurntableAfter(900, world); } else { stopTurntable(); }
+      return;
+    }
+
+    // Fallback: frame the meshes for the clicked side, else the whole group
+    if (focusMember && parts.has(focusMember)){
+      const box=new THREE.Box3(); const rec=parts.get(focusMember); rec.meshes.forEach(m=>box.expandByObject(m)); const s=box.getBoundingSphere(new THREE.Sphere());
+      if (canonKeyStr==='armpit'){ const sign = getSideSign(focusMember, s.center.x); startFocusFromSide(s.center, Math.max(1e-3,s.radius), sign, 900); stopTurntable(); return; }
+      startFocusTweenTo(s.center, Math.max(1e-3,s.radius), 900);
+      if (canonKeyStr==='upper arm' || canonKeyStr==='lower arm'){ startTurntableAfter(900, s.center.clone()); } else { stopTurntable(); }
+      return;
+    }
+    if (members.length){ const box=new THREE.Box3(); members.forEach(n=>{ const rec=parts.get(n); if(rec) rec.meshes.forEach(m=>box.expandByObject(m)); }); const s=box.getBoundingSphere(new THREE.Sphere()); if (canonKeyStr==='armpit'){ const sign = getSideSign(focusMember, s.center.x); startFocusFromSide(s.center, Math.max(1e-3,s.radius), sign, 900); stopTurntable(); } else { startFocusTweenTo(s.center, Math.max(1e-3,s.radius), 900); if (canonKeyStr==='upper arm' || canonKeyStr==='lower arm'){ startTurntableAfter(900, s.center.clone()); } else { stopTurntable(); } } }
+  }
+
+  // ---------- Resize ----------
+  window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth,window.innerHeight); camera.aspect=window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); updateDots(); });
+
+  // ---------- Animate ----------
+  let last = performance.now();
+  function animate(){
+    const now = performance.now();
+    const dt = now - last; last = now;
+
+    // step anim
+    meshes.forEach(m=>{ const a = meshAnim.get(m); if(!a) return; const dir = a.target - a.t; if (dir!==0){ const step = Math.min(1, dt/ANIM_MS); a.t += Math.sign(dir) * Math.min(Math.abs(dir), step); } applyShadingFromAnim(m); });
+
+    // optional slow orbit for arms
+    if (turntable.active && !focusTween){
+      const v = new THREE.Vector3().subVectors(camera.position, turntable.center);
+      const ang = turntable.speed * (dt/1000);
+      const cos = Math.cos(ang), sin = Math.sin(ang);
+      const nx = v.x*cos - v.z*sin;
+      const nz = v.x*sin + v.z*cos;
+      v.x = nx; v.z = nz;
+      camera.position.copy(turntable.center).add(v);
+      controls.target.copy(turntable.center);
+    }
+
+    stepFocusTween();
+    controls.update();
+    renderer.render(scene, camera);
+    updateDots();
+    requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
+
+  // ---------- Boot ----------
+  (async function boot(){ try{ const gltf = await tryURLs(GLB_URLS); if(gltf) attachModel(gltf); else setStatus('All sources failed.'); } catch(e){ console.error(e); setStatus('Error: '+e?.message); }})();
+
+  // ---------- Tests (do not remove) ----------
+  (function runPostLoadTests(){
+    console.log('%c[TEST] start','color:#0f0');
+    console.assert(renderer.getClearAlpha()===0,'canvas transparent');
+    console.assert(BLOCK_LIST.has('body'),'Body blocked');
+    console.assert(document.getElementById('reset'),'Reset exists');
+    console.assert(typeof startHomeTween==='function','home tween exists');
+    console.assert(typeof startFocusTweenTo==='function','focus tween exists');
+    console.assert(/^#([0-9a-f]{3}){1,2}$/i.test(shadePicker.value),'albedo color valid hex');
+    console.assert(parseFloat(albedoI.value)>=0 && parseFloat(albedoI.value)<=2,'albedo multiplier in range');
+    console.assert(/^#([0-9a-f]{3}){1,2}$/i.test(emiColor.value),'emissive color valid hex');
+    console.assert(parseFloat(emiI.value)>=0 && parseFloat(emiI.value)<=5,'emissive multiplier in range');
+    console.assert(document.getElementById('selList'),'selection list exists');
+    console.assert(document.getElementById('dots'),'dots layer exists');
+    console.assert(ANIM_MS===1000,'animation duration 1s');
+    
+    // URL fallback tests
+    console.assert(normalizeGitHubURL('https://github.com/u/r/blob/main/a.png').includes('/raw.githubusercontent.com/'),'URL normalized to raw');
+    console.assert(/^data:image\/png;base64,/.test(RAW_PLACEHOLDER),'placeholder is data URL');
+    console.log('%c[TEST] end','color:#0f0');
+  })();
+
+  </script>
+</body>
+</html>
